@@ -1,7 +1,7 @@
 # Lovable Clone
 
 Thank you so much for checking out this project! 🙏  
-We appreciate your interest and hope you enjoy exploring and building with it.
+We preciate your interest and hope you enjoy exploring and building with it.
 
 ## Getting Started
 
