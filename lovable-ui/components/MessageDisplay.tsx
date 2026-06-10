@@ -5,34 +5,77 @@ interface MessageDisplayProps {
   messages: SDKMessage[];
 }
 
+type ToolUseBlock = {
+  type: "tool_use";
+  name?: string;
+  input?: {
+    file_path?: string;
+    command?: string;
+  };
+};
+
+type DisplayMessage = SDKMessage | ToolUseBlock;
+
+function getToolUseBlocks(message: SDKMessage): ToolUseBlock[] {
+  if (message.type !== "assistant") {
+    return [];
+  }
+
+  const content = message.message.content;
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.filter(
+    (block): block is ToolUseBlock =>
+      typeof block === "object" &&
+      block !== null &&
+      "type" in block &&
+      block.type === "tool_use"
+  );
+}
+
+function getDisplayMessages(messages: SDKMessage[]): DisplayMessage[] {
+  return messages.flatMap<DisplayMessage>((message) => {
+    if (message.type === "assistant") {
+      return [message, ...getToolUseBlocks(message)];
+    }
+
+    if (message.type === "result") {
+      return [message];
+    }
+
+    return [];
+  });
+}
+
 export default function MessageDisplay({ messages }: MessageDisplayProps) {
   const [generatedPages, setGeneratedPages] = useState<string[]>([]);
   
   useEffect(() => {
     // Look for generated pages
     const pages = messages
-      .filter((m: any) => 
-        m.type === 'tool_use' && 
+      .flatMap(getToolUseBlocks)
+      .filter((m) => 
         m.name === 'Write' && 
         m.input?.file_path?.includes('/app/') &&
         (m.input?.file_path?.endsWith('.tsx') || m.input?.file_path?.endsWith('/page.tsx'))
       )
-      .map((m: any) => {
-        const path = m.input.file_path;
+      .map((m) => {
+        const path = m.input?.file_path ?? "";
         const match = path.match(/\/app\/([^\/]+)\//);
         return match ? `/${match[1]}` : null;
       })
-      .filter(Boolean);
+      .filter((page): page is string => page !== null);
     
-    setGeneratedPages([...new Set(pages)]);
+    setGeneratedPages(Array.from(new Set(pages)));
   }, [messages]);
   
   if (messages.length === 0) return null;
   
   // Filter to show only assistant messages and tool uses
-  const displayMessages = messages.filter(m => 
-    m.type === 'assistant' || m.type === 'tool_use' || m.type === 'result'
-  );
+  const displayMessages = getDisplayMessages(messages);
   
   return (
     <div className="mt-8 max-w-4xl mx-auto px-4">
@@ -59,8 +102,8 @@ export default function MessageDisplay({ messages }: MessageDisplayProps) {
         <div className="space-y-3">
           {displayMessages.map((message, index) => {
             // Assistant messages
-            if (message.type === 'assistant' && (message as any).message?.content) {
-              const content = (message as any).message.content;
+            if (message.type === 'assistant' && message.message?.content) {
+              const content = message.message.content;
               const textContent = Array.isArray(content) 
                 ? content.find((c: any) => c.type === 'text')?.text 
                 : content;
@@ -78,8 +121,8 @@ export default function MessageDisplay({ messages }: MessageDisplayProps) {
             
             // Tool uses - show as compact status
             if (message.type === 'tool_use') {
-              const toolName = (message as any).name;
-              const input = (message as any).input;
+              const toolName = message.name ?? "unknown";
+              const input = message.input;
               
               return (
                 <div key={index} className="animate-fadeIn">
@@ -103,17 +146,17 @@ export default function MessageDisplay({ messages }: MessageDisplayProps) {
             }
             
             // Final result
-            if (message.type === 'result' && (message as any).subtype === 'success') {
+            if (message.type === 'result' && message.subtype === 'success') {
               return (
                 <div key={index} className="animate-fadeIn mt-4">
                   <div className="bg-green-900/20 border border-green-700 rounded-lg p-4">
                     <div className="text-green-400 font-semibold mb-2">✅ Generation Complete</div>
                     <div className="text-gray-300 text-sm">
-                      {(message as any).result}
+                      {message.result}
                     </div>
-                    {(message as any).total_cost_usd && (
+                    {message.total_cost_usd && (
                       <div className="text-xs text-gray-500 mt-2">
-                        Cost: ${(message as any).total_cost_usd.toFixed(4)}
+                        Cost: ${message.total_cost_usd.toFixed(4)}
                       </div>
                     )}
                   </div>
