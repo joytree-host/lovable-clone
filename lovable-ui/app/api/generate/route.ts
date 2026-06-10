@@ -1,5 +1,26 @@
 import { NextRequest } from "next/server";
-import { query } from "@anthropic-ai/claude-code";
+import { query, type SDKAssistantMessage } from "@anthropic-ai/claude-code";
+
+type ToolUseBlock = {
+  type: "tool_use";
+  name?: string;
+};
+
+function getToolUseBlocks(message: SDKAssistantMessage): ToolUseBlock[] {
+  const content = message.message.content;
+
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  return content.filter(
+    (block): block is ToolUseBlock =>
+      typeof block === "object" &&
+      block !== null &&
+      "type" in block &&
+      block.type === "tool_use"
+  );
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -48,10 +69,12 @@ export async function POST(req: NextRequest) {
           console.log(`[API] Message ${messageCount} - Type: ${message.type}`);
           
           // Log specific details based on message type
-          if (message.type === 'tool_use') {
-            console.log(`[API] Tool use: ${(message as any).name}`);
+          if (message.type === 'assistant') {
+            for (const toolUse of getToolUseBlocks(message)) {
+              console.log(`[API] Tool use: ${toolUse.name ?? 'unknown'}`);
+            }
           } else if (message.type === 'result') {
-            console.log(`[API] Result: ${(message as any).subtype}`);
+            console.log(`[API] Result: ${message.subtype}`);
           }
           
           // Send the message to the client
