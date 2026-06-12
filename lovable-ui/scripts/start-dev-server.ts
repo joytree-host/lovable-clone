@@ -1,4 +1,4 @@
-import { Daytona } from "@daytona/sdk";
+import { Daytona } from "@daytonaio/sdk";
 import * as dotenv from "dotenv";
 import * as path from "path";
 
