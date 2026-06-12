@@ -5,6 +5,137 @@ import * as path from "path";
 // Load environment variables
 dotenv.config({ path: path.join(__dirname, "../../.env") });
 
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+const SANDBOX_LABELS = {
+  app: "lovable-clone",
+  purpose: "website-generation",
+};
+
+function isDiskLimitError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.toLowerCase().includes("disk limit exceeded");
+}
+
+async function prepareSandboxForReuse(
+  sandbox: any,
+  options: { allowStart: boolean; requireMarker: boolean }
+) {
+  if (sandbox.state && sandbox.state !== "started") {
+    if (!options.allowStart) {
+      return undefined;
+    }
+
+    console.log(`Starting reusable sandbox ${sandbox.id} (${sandbox.state})...`);
+    await sandbox.start(120);
+  }
+
+  const rootDir = await sandbox.getUserRootDir();
+  if (!options.requireMarker) {
+    return rootDir;
+  }
+
+  const markerCheck = await sandbox.process.executeCommand(
+    "test -d website-project -o -d .claude-code-runner && echo yes || echo no",
+    rootDir
+  );
+
+  return markerCheck.result?.trim() === "yes" ? rootDir : undefined;
+}
+
+async function findReusableSandbox(daytona: Daytona) {
+  const allSandboxes = await daytona.list();
+  const labeledSandboxes = allSandboxes.filter(
+    (sandbox: any) =>
+      sandbox.labels?.app === SANDBOX_LABELS.app &&
+      sandbox.labels?.purpose === SANDBOX_LABELS.purpose
+  );
+
+  for (const sandbox of labeledSandboxes) {
+    try {
+      await prepareSandboxForReuse(sandbox, {
+        allowStart: true,
+        requireMarker: false,
+      });
+      return sandbox;
+    } catch (error: any) {
+      console.log(
+        `Could not reuse labeled sandbox ${sandbox.id}: ${error.message}`
+      );
+    }
+  }
+
+  // Older versions of this flow created unlabeled sandboxes. Only adopt one if it
+  // already contains our known project/runner directories.
+  for (const sandbox of allSandboxes) {
+    if (labeledSandboxes.some((labeled: any) => labeled.id === sandbox.id)) {
+      continue;
+    }
+
+    try {
+      const rootDir = await prepareSandboxForReuse(sandbox, {
+        allowStart: false,
+        requireMarker: true,
+      });
+      if (rootDir) {
+        console.log(`✓ Reusing existing generated-site sandbox: ${sandbox.id}`);
+        await sandbox.setLabels(SANDBOX_LABELS);
+        return sandbox;
+      }
+    } catch (error: any) {
+      console.log(`Skipping sandbox ${sandbox.id}: ${error.message}`);
+    }
+  }
+
+  return undefined;
+}
+
+async function createOrReuseSandbox(daytona: Daytona, sandboxId?: string) {
+  if (sandboxId) {
+    console.log(`1. Using existing sandbox: ${sandboxId}`);
+    const sandbox = await daytona.get(sandboxId);
+    await prepareSandboxForReuse(sandbox, {
+      allowStart: true,
+      requireMarker: false,
+    });
+    console.log(`✓ Connected to sandbox: ${sandbox.id}`);
+    return sandbox;
+  }
+
+  console.log("1. Looking for an existing website-generation sandbox...");
+  const reusableSandbox = await findReusableSandbox(daytona);
+  if (reusableSandbox) {
+    console.log(`✓ Reusing sandbox: ${reusableSandbox.id}`);
+    return reusableSandbox;
+  }
+
+  console.log("1. Creating new Daytona sandbox...");
+  try {
+    const sandbox = await daytona.create({
+      public: true,
+      image: "node:20",
+      labels: SANDBOX_LABELS,
+      resources: {
+        disk: 10,
+      },
+      autoStopInterval: 15,
+      autoArchiveInterval: 60,
+    });
+    console.log(`✓ Sandbox created: ${sandbox.id}`);
+    return sandbox;
+  } catch (error) {
+    if (isDiskLimitError(error)) {
+      throw new Error(
+        "Daytona disk limit exceeded and no reusable generated-site sandbox was found. " +
+          "Open Daytona and delete old/unused sandboxes, then try again."
+      );
+    }
+    throw error;
+  }
+}
+
 async function generateWebsiteInDaytona(
   sandboxIdArg?: string,
   prompt?: string
@@ -24,48 +155,42 @@ async function generateWebsiteInDaytona(
   let sandboxId = sandboxIdArg;
 
   try {
-    // Step 1: Create or get sandbox
-    if (sandboxId) {
-      console.log(`1. Using existing sandbox: ${sandboxId}`);
-      // Get existing sandbox
-      const sandboxes = await daytona.list();
-      sandbox = sandboxes.find((s: any) => s.id === sandboxId);
-      if (!sandbox) {
-        throw new Error(`Sandbox ${sandboxId} not found`);
-      }
-      console.log(`✓ Connected to sandbox: ${sandbox.id}`);
-    } else {
-      console.log("1. Creating new Daytona sandbox...");
-      sandbox = await daytona.create({
-        public: true,
-        image: "node:20",
-      });
-      sandboxId = sandbox.id;
-      console.log(`✓ Sandbox created: ${sandboxId}`);
-    }
+    sandbox = await createOrReuseSandbox(daytona, sandboxId);
+    sandboxId = sandbox.id;
 
-    // Get the root directory
     const rootDir = await sandbox.getUserRootDir();
     console.log(`✓ Working directory: ${rootDir}`);
 
-    // Step 2: Create project directory
-    console.log("\n2. Setting up project directory...");
+    // Keep the Claude Code SDK outside the generated app. Claude can safely rewrite
+    // the app's package.json without deleting the runner dependency mid-flow.
+    const runnerDir = `${rootDir}/.claude-code-runner`;
     const projectDir = `${rootDir}/website-project`;
-    await sandbox.process.executeCommand(`mkdir -p ${projectDir}`, rootDir);
-    console.log(`✓ Created project directory: ${projectDir}`);
 
-    // Step 3: Initialize npm project
-    console.log("\n3. Initializing npm project...");
-    await sandbox.process.executeCommand("npm init -y", projectDir);
-    console.log("✓ Package.json created");
+    // Step 2: Create project and runner directories
+    console.log("\n2. Setting up project directory...");
+    await sandbox.process.executeCommand(
+      `rm -rf ${shellQuote(projectDir)} && mkdir -p ${shellQuote(projectDir)} ${shellQuote(runnerDir)}`,
+      rootDir,
+      undefined,
+      120
+    );
+    console.log(`✓ Created clean project directory: ${projectDir}`);
 
-    // Step 4: Install Claude Code SDK locally in project
+    // Step 3: Initialize SDK runner package
+    console.log("\n3. Initializing Claude Code runner...");
+    await sandbox.process.executeCommand(
+      "test -f package.json || npm init -y",
+      runnerDir
+    );
+    console.log("✓ Runner package.json ready");
+
+    // Step 4: Install Claude Code SDK in the isolated runner directory
     console.log("\n4. Installing Claude Code SDK locally...");
     const installResult = await sandbox.process.executeCommand(
       "npm install @anthropic-ai/claude-code@latest",
-      projectDir,
+      runnerDir,
       undefined,
-      180000 // 3 minute timeout
+      180
     );
 
     if (installResult.exitCode !== 0) {
@@ -74,25 +199,36 @@ async function generateWebsiteInDaytona(
     }
     console.log("✓ Claude Code SDK installed");
 
-    // Verify installation
+    // Verify installation and resolve the concrete SDK entrypoint up front.
     console.log("\n5. Verifying installation...");
     const checkInstall = await sandbox.process.executeCommand(
-      "ls -la node_modules/@anthropic-ai/claude-code",
-      projectDir
+      "node -e \"console.log(require.resolve('@anthropic-ai/claude-code'))\"",
+      runnerDir
     );
-    console.log("Installation check:", checkInstall.result);
+
+    if (checkInstall.exitCode !== 0 || !checkInstall.result?.trim()) {
+      console.error("Installation check failed:", checkInstall.result);
+      throw new Error("Claude Code SDK is installed but could not be resolved");
+    }
+
+    const sdkPath = checkInstall.result.trim().split("\n").pop()!;
+    console.log(`✓ Claude Code SDK resolved: ${sdkPath}`);
 
     // Step 6: Create the generation script file
     console.log("\n6. Creating generation script file...");
 
-    const generationScript = `const { query } = require('@anthropic-ai/claude-code');
-const fs = require('fs');
+    const userPrompt =
+      prompt || "Create a modern blog website with markdown support and a dark theme";
+
+    const generationScript = `const fs = require('fs');
+
+async function loadClaudeCode() {
+  return await import(${JSON.stringify(sdkPath)});
+}
 
 async function generateWebsite() {
-  const prompt = \`${
-    prompt ||
-    "Create a modern blog website with markdown support and a dark theme"
-  }
+  const { query } = await loadClaudeCode();
+  const prompt = ${JSON.stringify(`${userPrompt}
   
   Important requirements:
   - Create a NextJS app with TypeScript and Tailwind CSS
@@ -102,7 +238,7 @@ async function generateWebsite() {
   - Make the design modern and responsive
   - Add at least a home page and one other page
   - Include proper navigation between pages
-  \`;
+  `)};
 
   console.log('Starting website generation with Claude Code...');
   console.log('Working directory:', process.cwd());
@@ -130,7 +266,6 @@ async function generateWebsite() {
     })) {
       messages.push(message);
       
-      // Log progress
       if (message.type === 'text') {
         console.log('[Claude]:', (message.text || '').substring(0, 80) + '...');
         console.log('__CLAUDE_MESSAGE__', JSON.stringify({ type: 'assistant', content: message.text }));
@@ -152,10 +287,8 @@ async function generateWebsite() {
     console.log('\\nGeneration complete!');
     console.log('Total messages:', messages.length);
     
-    // Save generation log
     fs.writeFileSync('generation-log.json', JSON.stringify(messages, null, 2));
     
-    // List generated files
     const files = fs.readdirSync('.').filter(f => !f.startsWith('.'));
     console.log('\\nGenerated files:', files.join(', '));
     
@@ -166,27 +299,26 @@ async function generateWebsite() {
   }
 }
 
-generateWebsite().catch(console.error);`;
+generateWebsite().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});`;
 
-    // Write the script to a file
     await sandbox.process.executeCommand(
-      `cat > generate.js << 'SCRIPT_EOF'
-${generationScript}
-SCRIPT_EOF`,
+      `cat > generate.js << 'SCRIPT_EOF'\n${generationScript}\nSCRIPT_EOF`,
       projectDir
     );
     console.log("✓ Generation script written to generate.js");
 
-    // Verify the script was created
     const checkScript = await sandbox.process.executeCommand(
-      "ls -la generate.js && head -5 generate.js",
+      "ls -la generate.js && head -12 generate.js",
       projectDir
     );
     console.log("Script verification:", checkScript.result);
 
     // Step 7: Run the generation script
     console.log("\n7. Running Claude Code generation...");
-    console.log(`Prompt: "${prompt || "Create a modern blog website"}"`);
+    console.log(`Prompt: "${userPrompt}"`);
     console.log("\nThis may take several minutes...\n");
 
     const genResult = await sandbox.process.executeCommand(
@@ -194,9 +326,9 @@ SCRIPT_EOF`,
       projectDir,
       {
         ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
-        NODE_PATH: `${projectDir}/node_modules`,
+        NODE_PATH: `${runnerDir}/node_modules`,
       },
-      600000 // 10 minute timeout
+      600
     );
 
     console.log("\nGeneration output:");
@@ -208,10 +340,7 @@ SCRIPT_EOF`,
 
     // Step 8: Check generated files
     console.log("\n8. Checking generated files...");
-    const filesResult = await sandbox.process.executeCommand(
-      "ls -la",
-      projectDir
-    );
+    const filesResult = await sandbox.process.executeCommand("ls -la", projectDir);
     console.log(filesResult.result);
 
     // Step 9: Install dependencies if package.json was updated
@@ -226,7 +355,7 @@ SCRIPT_EOF`,
         "npm install",
         projectDir,
         undefined,
-        300000 // 5 minute timeout
+        300
       );
 
       if (npmInstall.exitCode !== 0) {
@@ -238,7 +367,6 @@ SCRIPT_EOF`,
       // Step 10: Start dev server in background
       console.log("\n10. Starting development server in background...");
 
-      // Start the server in background using nohup
       await sandbox.process.executeCommand(
         `nohup npm run dev > dev-server.log 2>&1 &`,
         projectDir,
@@ -247,17 +375,15 @@ SCRIPT_EOF`,
 
       console.log("✓ Server started in background");
 
-      // Wait a bit for server to initialize
       console.log("Waiting for server to start...");
       await new Promise((resolve) => setTimeout(resolve, 8000));
 
-      // Check if server is running
       const checkServer = await sandbox.process.executeCommand(
         "curl -s -o /dev/null -w '%{http_code}' http://localhost:3000 || echo 'failed'",
         projectDir
       );
 
-      if (checkServer.result?.trim() === '200') {
+      if (checkServer.result?.trim() === "200") {
         console.log("✓ Server is running!");
       } else {
         console.log("⚠️  Server might still be starting...");
@@ -306,7 +432,6 @@ SCRIPT_EOF`,
       console.log(`\nSandbox ID: ${sandboxId}`);
       console.log("The sandbox is still running for debugging.");
 
-      // Try to get debug info
       try {
         const debugInfo = await sandbox.process.executeCommand(
           "pwd && echo '---' && ls -la && echo '---' && test -f generate.js && cat generate.js | head -20 || echo 'No script'",
@@ -315,7 +440,7 @@ SCRIPT_EOF`,
         console.log("\nDebug info:");
         console.log(debugInfo.result);
       } catch (e) {
-        // Ignore
+        // Ignore debug collection failures
       }
     }
 
@@ -329,9 +454,7 @@ async function main() {
   let sandboxId: string | undefined;
   let prompt: string | undefined;
 
-  // Parse arguments
   if (args.length > 0) {
-    // Check if first arg is a sandbox ID (UUID format)
     const uuidRegex =
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     if (uuidRegex.test(args[0])) {
@@ -361,11 +484,5 @@ async function main() {
     process.exit(1);
   }
 }
-
-// Handle graceful shutdown
-process.on("SIGINT", () => {
-  console.log("\n\n👋 Exiting... The sandbox will continue running.");
-  process.exit(0);
-});
 
 main();
