@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { Suspense, useState, useEffect, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Navbar from "@/components/Navbar";
 
@@ -15,7 +15,7 @@ interface Message {
   sandboxId?: string;
 }
 
-export default function GeneratePage() {
+function GenerateContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const prompt = searchParams.get("prompt") || "";
@@ -256,5 +256,23 @@ export default function GeneratePage() {
         </div>
       </div>
     </main>
+  );
+}
+
+export default function GeneratePage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="h-screen bg-black flex flex-col overflow-hidden relative">
+          <Navbar />
+          <div className="h-16" />
+          <div className="flex-1 flex items-center justify-center text-gray-400">
+            Loading generator...
+          </div>
+        </main>
+      }
+    >
+      <GenerateContent />
+    </Suspense>
   );
 }

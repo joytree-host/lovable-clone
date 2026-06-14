@@ -17,7 +17,10 @@ async function getPreviewUrl(sandboxId: string, port: number = 3000) {
 
   try {
     // Get sandbox
-    const sandboxes = await daytona.list();
+    const listResult: any = await daytona.list();
+    const sandboxes: any[] = Array.isArray(listResult)
+      ? listResult
+      : listResult?.items ?? listResult?.sandboxes ?? listResult?.data ?? [];
     const sandbox = sandboxes.find((s: any) => s.id === sandboxId);
     
     if (!sandbox) {
